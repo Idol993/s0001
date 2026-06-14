@@ -309,42 +309,58 @@ class ExternalMemory(nn.Module):
     def rewrite(
         self,
         memory_indices: torch.Tensor,
+        new_values: torch.Tensor,
+        new_attribute_embeds: torch.Tensor,
+        update_mask: torch.Tensor,
         new_keys: Optional[torch.Tensor] = None,
-        new_values: Optional[torch.Tensor] = None,
         new_entity_embeds: Optional[torch.Tensor] = None,
-        new_attribute_embeds: Optional[torch.Tensor] = None,
-        update_mask: Optional[torch.Tensor] = None,
-    ) -> None:
-        for idx in memory_indices.flatten():
-            idx = idx.item()
-            if idx < 0 or idx >= self.memory_size:
-                continue
+    ) -> int:
+        batch_size, num_conflicts, seq_len = memory_indices.shape
 
-            if update_mask is not None:
-                mask = update_mask.flatten()[memory_indices.flatten() == idx]
-            else:
-                mask = 1.0
+        indices_flat = memory_indices.reshape(-1)
+        values_flat = new_values.reshape(-1, self.value_dim)
+        attr_flat = new_attribute_embeds.reshape(-1, self.config.attribute_embedding_dim)
+        mask_flat = update_mask.reshape(-1)
+
+        valid_mask = (indices_flat >= 0) & (indices_flat < self.memory_size) & (mask_flat > 0.5)
+        valid_indices = indices_flat[valid_mask]
+        valid_values = values_flat[valid_mask]
+        valid_attr = attr_flat[valid_mask]
+        valid_mask_vals = mask_flat[valid_mask]
+
+        num_updates = 0
+        for i in range(len(valid_indices)):
+            idx = valid_indices[i].item()
+            alpha = valid_mask_vals[i].item()
+
+            self.memory_values.data[idx] = (
+                alpha * valid_values[i] +
+                (1 - alpha) * self.memory_values.data[idx]
+            )
+            self.memory_attribute_embeds.data[idx] = (
+                alpha * valid_attr[i] +
+                (1 - alpha) * self.memory_attribute_embeds.data[idx]
+            )
 
             if new_keys is not None:
+                keys_flat = new_keys.reshape(-1, self.key_dim)
+                valid_keys = keys_flat[valid_mask]
                 self.memory_keys.data[idx] = (
-                    mask * new_keys.flatten(0, 1)[memory_indices.flatten() == idx] +
-                    (1 - mask) * self.memory_keys.data[idx]
+                    alpha * valid_keys[i] +
+                    (1 - alpha) * self.memory_keys.data[idx]
                 )
-            if new_values is not None:
-                self.memory_values.data[idx] = (
-                    mask * new_values.flatten(0, 1)[memory_indices.flatten() == idx] +
-                    (1 - mask) * self.memory_values.data[idx]
-                )
+
             if new_entity_embeds is not None:
+                entity_flat = new_entity_embeds.reshape(-1, self.config.entity_embedding_dim)
+                valid_entity = entity_flat[valid_mask]
                 self.memory_entity_embeds.data[idx] = (
-                    mask * new_entity_embeds.flatten(0, 1)[memory_indices.flatten() == idx] +
-                    (1 - mask) * self.memory_entity_embeds.data[idx]
+                    alpha * valid_entity[i] +
+                    (1 - alpha) * self.memory_entity_embeds.data[idx]
                 )
-            if new_attribute_embeds is not None:
-                self.memory_attribute_embeds.data[idx] = (
-                    mask * new_attribute_embeds.flatten(0, 1)[memory_indices.flatten() == idx] +
-                    (1 - mask) * self.memory_attribute_embeds.data[idx]
-                )
+
+            num_updates += 1
+
+        return num_updates
 
     def get_entity_memory(self, entity_id: int) -> Dict[str, torch.Tensor]:
         mask = self.memory_entity_ids == entity_id

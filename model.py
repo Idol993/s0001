@@ -142,7 +142,8 @@ class MemoryAugmentedLLM(nn.Module):
             past_key_values = attn_info.get("past_key_values")
             all_attn_info.append(attn_info)
 
-        predicted_entity_ids = self.entity_id_predictor(hidden_states).argmax(dim=-1)
+        entity_logits = self.entity_id_predictor(hidden_states)
+        predicted_entity_ids = entity_logits.argmax(dim=-1)
         if entity_ids is None:
             entity_ids = predicted_entity_ids
 
@@ -197,13 +198,13 @@ class MemoryAugmentedLLM(nn.Module):
                     timestamps,
                 )
 
-                self.external_memory.rewrite(
+                num_updates = self.external_memory.rewrite(
                     rewrite_result["memory_indices"],
-                    new_values=rewrite_result["new_values"].mean(dim=2),
-                    new_attribute_embeds=rewrite_result["new_attribute_embeds"].mean(dim=2),
-                    update_mask=rewrite_result["update_mask"].mean(dim=2),
+                    rewrite_result["new_values"],
+                    rewrite_result["new_attribute_embeds"],
+                    rewrite_result["update_mask"],
                 )
-
+                rewrite_result["num_memory_updates"] = num_updates
                 rewrite_info = rewrite_result
 
         hidden_states = hidden_states + correction_signals
@@ -226,6 +227,7 @@ class MemoryAugmentedLLM(nn.Module):
             "rewrite_info": rewrite_info,
             "correction_signals": correction_signals,
             "gradient_masks": gradient_masks,
+            "entity_logits": entity_logits,
             "predicted_entity_ids": predicted_entity_ids,
             "conflict_logits": conflict_logits,
             "attention_info": all_attn_info,

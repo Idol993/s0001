@@ -234,7 +234,7 @@ class ContradictionLoss(nn.Module):
         )
 
         entity_loss = F.cross_entropy(
-            outputs["predicted_entity_ids"].view(-1, 1000),
+            outputs["entity_logits"].view(-1, 1000),
             batch.entity_ids.view(-1),
             ignore_index=0
         )

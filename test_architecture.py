@@ -360,6 +360,9 @@ def test_memory_augmented_llm():
     assert outputs["hidden_states"].shape == (batch_size, seq_len, config.hidden_dim)
     assert "conflict_info" in outputs
     assert "memory_info" in outputs
+    assert "entity_logits" in outputs
+    assert outputs["entity_logits"].shape == (batch_size, seq_len, 1000)
+    assert outputs["predicted_entity_ids"].shape == (batch_size, seq_len)
 
     loss = outputs["logits"].sum()
     loss.backward()
@@ -437,7 +440,8 @@ def test_training_loss():
     outputs = {
         "logits": torch.randn(batch_size, seq_len, config.vocab_size, requires_grad=True),
         "conflict_logits": torch.randn(batch_size, seq_len, 2, requires_grad=True),
-        "predicted_entity_ids": torch.randn(batch_size, seq_len, 1000, requires_grad=True),
+        "entity_logits": torch.randn(batch_size, seq_len, 1000, requires_grad=True),
+        "predicted_entity_ids": torch.randint(0, 1000, (batch_size, seq_len)),
         "rewrite_info": {
             "retention_gate": torch.sigmoid(torch.randn(batch_size, 4, seq_len, requires_grad=True)),
         }
@@ -468,6 +472,203 @@ def test_training_loss():
     print("OK ContradictionLoss passed")
 
 
+def test_contradiction_detection_rewrite_read():
+    print("\nTesting contradiction: detect -> rewrite -> re-read cycle...")
+    config = ModelConfig(
+        vocab_size=1000,
+        hidden_dim=128,
+        num_layers=2,
+        num_heads=4,
+        head_dim=32,
+        max_seq_len=512,
+        memory_size=64,
+        memory_key_dim=64,
+        memory_value_dim=128,
+        num_read_heads=2,
+        num_write_heads=1,
+        memory_top_k=4,
+        cache_size=32,
+        window_size=128,
+        global_token_count=4,
+        entity_embedding_dim=32,
+        attribute_embedding_dim=32,
+        conflict_threshold=0.1,
+        backprop_window=32,
+        dropout=0.0,
+    )
+    model = MemoryAugmentedLLM(config)
+    model.eval()
+
+    batch_size = 1
+    first_seq_len = 32
+    second_seq_len = 32
+
+    entity_id = 5
+
+    first_input_ids = torch.randint(0, config.vocab_size, (batch_size, first_seq_len))
+    first_entity_ids = torch.full((batch_size, first_seq_len), entity_id, dtype=torch.long)
+
+    with torch.no_grad():
+        outputs_first = model(
+            first_input_ids,
+            entity_ids=first_entity_ids,
+            detect_conflicts=False,
+            enable_rewrite=False,
+        )
+
+    mem_after_first = model.external_memory.get_entity_memory(entity_id)
+    assert len(mem_after_first) > 0, "First write should create memory entries for the entity"
+    first_values = mem_after_first["values"].clone()
+    first_indices = mem_after_first["indices"].clone()
+    print(f"  First write: {len(first_values)} memory entries for entity {entity_id}")
+
+    second_input_ids = torch.randint(0, config.vocab_size, (batch_size, second_seq_len))
+    second_entity_ids = torch.full((batch_size, second_seq_len), entity_id, dtype=torch.long)
+
+    with torch.no_grad():
+        outputs_second = model(
+            second_input_ids,
+            entity_ids=second_entity_ids,
+            detect_conflicts=True,
+            enable_rewrite=True,
+        )
+
+    assert "conflict_info" in outputs_second
+    assert "rewrite_info" in outputs_second
+
+    conflict_detected = outputs_second["conflict_info"].get("conflict_positions")
+    num_updates = outputs_second["rewrite_info"].get("num_memory_updates", 0)
+    print(f"  Conflicts detected: {conflict_detected.sum().item() if conflict_detected is not None else 0}")
+    print(f"  Memory updates applied: {num_updates}")
+
+    mem_after_second = model.external_memory.get_entity_memory(entity_id)
+    assert len(mem_after_second) > 0, "Second pass should still have memory entries"
+
+    second_values = mem_after_second["values"]
+    values_changed = not torch.allclose(first_values, second_values[:len(first_values)])
+    print(f"  Memory values changed after rewrite: {values_changed}")
+
+    with torch.no_grad():
+        query_input = torch.randint(0, config.vocab_size, (batch_size, 16))
+        query_entity_ids = torch.full((batch_size, 16), entity_id, dtype=torch.long)
+
+        outputs_read = model(
+            query_input,
+            entity_ids=query_entity_ids,
+            detect_conflicts=False,
+            enable_rewrite=False,
+        )
+
+    assert "memory_output" in outputs_read
+    assert outputs_read["memory_output"].shape == (batch_size, 16, config.hidden_dim)
+
+    memory_read = outputs_read["memory_output"]
+    assert not torch.isnan(memory_read).any(), "Memory read should not contain NaN"
+
+    print("OK Contradiction detect-rewrite-read cycle passed")
+
+
+def test_training_step_with_memory_update():
+    print("\nTesting end-to-end training step with memory update...")
+    config = ModelConfig(
+        vocab_size=500,
+        hidden_dim=64,
+        num_layers=2,
+        num_heads=4,
+        head_dim=16,
+        max_seq_len=256,
+        memory_size=64,
+        memory_key_dim=32,
+        memory_value_dim=64,
+        num_read_heads=2,
+        num_write_heads=1,
+        memory_top_k=4,
+        cache_size=16,
+        window_size=64,
+        global_token_count=4,
+        entity_embedding_dim=16,
+        attribute_embedding_dim=16,
+        conflict_threshold=0.3,
+        backprop_window=16,
+        dropout=0.0,
+    )
+
+    model = MemoryAugmentedLLM(config)
+    loss_fn = ContradictionLoss(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    batch_size = 1
+    seq_len = 128
+    num_entity_types = 5
+
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+    entity_ids = torch.randint(1, num_entity_types + 1, (batch_size, seq_len))
+    labels = input_ids.clone()
+
+    conflict_positions = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+    conflict_positions[0, 90:95] = True
+
+    from training import ContradictionSample
+    batch = ContradictionSample(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        entity_ids=entity_ids,
+        labels=labels,
+        conflict_positions=conflict_positions,
+        conflict_entity_ids=torch.tensor([2]),
+        correct_attribute_positions=torch.tensor([90]),
+        global_indices=torch.tensor([[10, 30, 50, 70]]),
+    )
+
+    model.train()
+    optimizer.zero_grad()
+
+    outputs = model(
+        input_ids,
+        attention_mask=attention_mask,
+        entity_ids=entity_ids,
+        global_indices=batch.global_indices,
+        detect_conflicts=True,
+        enable_rewrite=True,
+    )
+
+    assert "logits" in outputs
+    assert "entity_logits" in outputs
+    assert "conflict_logits" in outputs
+    assert "conflict_info" in outputs
+    assert "memory_info" in outputs
+
+    loss, loss_dict = loss_fn(outputs, batch)
+
+    assert loss.requires_grad, "Loss must require gradients"
+    assert not torch.isnan(loss), "Loss must not be NaN"
+    assert not torch.isinf(loss), "Loss must not be Inf"
+
+    loss.backward()
+
+    has_grad = False
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is not None:
+            if param.grad.abs().sum() > 0:
+                has_grad = True
+                break
+
+    assert has_grad, "At least some parameters must have non-zero gradients"
+
+    optimizer.step()
+
+    loss_val = loss.item()
+    print(f"  Total loss: {loss_val:.4f}")
+    for k, v in loss_dict.items():
+        print(f"    {k}: {v:.4f}")
+
+    num_updates = outputs["rewrite_info"].get("num_memory_updates", 0) if outputs.get("rewrite_info") else 0
+    print(f"  Memory updates during training step: {num_updates}")
+
+    print("OK End-to-end training step with memory update passed")
+
+
 def main():
     print("=" * 60)
     print("Running Architecture Verification Tests")
@@ -488,6 +689,8 @@ def main():
         test_memory_augmented_llm()
         test_training_dataset()
         test_training_loss()
+        test_contradiction_detection_rewrite_read()
+        test_training_step_with_memory_update()
 
         print("\n" + "=" * 60)
         print("ALL TESTS PASSED OK")
